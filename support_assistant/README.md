@@ -1,11 +1,11 @@
-﻿# Module 3: Zepto Support Assistant (`/support_assistant`)
+﻿# Support Assistant (`/support_assistant`)
 
-## 1. Overview & Business Context
-Zepto quick commerce operates 24/7 with strict 10–30 minute delivery SLAs. To maintain high customer satisfaction without ballooning support overhead, Zepto deploys a grounded GenAI Support Assistant. The service ingests Zepto’s official operational policies, routes incoming inquiries using a LangGraph state machine, retrieves grounded context from a local ChromaDB vector store, and returns structured Pydantic-validated JSON responses.
+## Overview
+This module implements a grounded GenAI customer support service for Zepto. It reads 8 official company policy documents, stores dense vector embeddings in a local ChromaDB collection, routes incoming user questions using a 3-node LangGraph StateGraph, and validates JSON responses using Pydantic models.
 
 ---
 
-## 2. RAG Pipeline Architecture
+## 1. RAG Pipeline Architecture
 
 ```text
 [User Query via POST /ask]
@@ -21,12 +21,12 @@ Zepto quick commerce operates 24/7 with strict 10–30 minute delivery SLAs. To 
      ▼                        ▼
 [Node 2: retrieve_and_answer]  [Node 3: direct_answer]
 ┌─────────────────────────┐   ┌───────────────────────────┐
-│ 1. Local Dense Embed    │   │ Canned Polite Refusal:    │
+│ 1. Local Dense Embed    │   │ Polite Refusal:           │
 │    (all-MiniLM-L6-v2)   │   │ "I can only answer        │
 │ 2. Cosine Vector Search │   │ questions about Zepto     │
 │    (ChromaDB Top-3)     │   │ policies right now."      │
-│ 3. Grounded Answer Gen  │   │ sources: [], conf: 1.0    │
-│    (Canned / LLM)       │   └─────────────┬─────────────┘
+│ 3. Grounded Generation  │   │ sources: [], conf: 1.0    │
+│    (Templated / LLM)    │   └─────────────┬─────────────┘
 └────────────┬────────────┘                 │
              │                              │
              └──────────────┬───────────────┘
@@ -38,42 +38,44 @@ Zepto quick commerce operates 24/7 with strict 10–30 minute delivery SLAs. To 
              [HTTP 200 JSON Response]
 ```
 
-### Stage-by-Stage Breakdown
+### Stage-by-Stage Implementation
 
-1. **Ingestion (`support_assistant/rag.py: ingest_corpus`)**:
-   - Ingests 8 official Zepto policy documents from `support_assistant/docs/` (`doc_01.txt` through `doc_08.txt`) covering delivery tiers, return/refund windows, membership perks, rider tracking, cancellation, damaged goods, gift cards, and support availability.
+1. **Ingestion (`support_assistant/rag.py`)**:
+   - Reads all 8 policy files in `docs/` (`doc_01.txt` through `doc_08.txt`) covering delivery timelines, returns and refunds, membership tiers, rider tracking, order cancellation, damaged items, gift cards, and support hours.
 2. **Embedding (`sentence-transformers/all-MiniLM-L6-v2`)**:
-   - Transforms text chunks into 384-dimensional dense semantic vectors locally. Runs 100% on CPU without requiring external API keys or paid accounts.
+   - Encodes text chunks into 384-dimensional dense vectors on the CPU locally. No external embedding API or network access is needed.
 3. **Storage & Retrieval (`ChromaDB`)**:
    - Persisted at `support_assistant/chroma_db` under collection `zepto_policies`.
-   - Function `retrieve_top_k(query, k=3)` performs exact cosine similarity search ($\text{similarity} = 1 - \text{cosine\_distance}$) and extracts top document chunks with metadata.
-4. **Generation & Orchestration (`LangGraph StateGraph` in `support_assistant/graph.py`)**:
-   - Coordinates intent routing via `classify_intent`.
-   - Directs policy questions to `retrieve_and_answer` and non-policy questions to `direct_answer`.
-5. **Schema Validation & Retry (`support_assistant/models.py`)**:
-   - Enforces Pydantic model `QueryResponse(answer=..., sources=..., confidence=...)`.
-   - In real-LLM mode (`MOCK_LLM=0`), includes automated 2-stage retry logic if raw LLM generation fails JSON schema validation.
+   - `retrieve_top_k()` uses cosine similarity to return the top 3 matching chunks with distances and metadata.
+4. **Graph Orchestration (`support_assistant/graph.py`)**:
+   - Built with LangGraph `StateGraph`.
+   - `classify_intent`: Determines whether the query asks about a company policy or is a general query.
+   - `retrieve_and_answer`: Retrieves top policy chunks from ChromaDB and builds the answer.
+   - `direct_answer`: Handles general inquiries politely without retrieving documents.
+5. **Output Validation (`support_assistant/models.py`)**:
+   - Uses Pydantic to enforce `{ "answer": str, "sources": list, "confidence": float }`.
 
 ---
 
-## 3. The `MOCK_LLM` Toggle & Dual Execution Modes
+## 2. The `MOCK_LLM` Toggle
 
-Every LLM dependency is gated behind the environment variable `MOCK_LLM`:
+Every LLM generation step is controlled by the `MOCK_LLM` environment variable:
 
-| Feature / Stage | Default Mock Mode (`MOCK_LLM=1` or unset) [Graded Baseline] | Real LLM Mode (`MOCK_LLM=0`) [Optional Extension] |
-|---|---|---|
-| **External Dependencies** | None. Zero API keys, zero network calls to LLM APIs. | Groq API key (`GROQ_API_KEY`) or free-tier OpenAI-compatible LLM. |
-| **Node 1: Intent Classification** | Deterministic keyword check for `delivery`, `return`, `refund`, `membership`, `tracking`, `cancel`, `gift card`, `support hours`. | Few-shot zero-temperature classification prompt via LLM. |
-| **Vector Retrieval** | **Real cosine retrieval** via `all-MiniLM-L6-v2` and ChromaDB. | **Real cosine retrieval** via `all-MiniLM-L6-v2` and ChromaDB. |
-| **Node 2: Policy Answer Generation** | Deterministic templated response: `f"Based on the retrieved context: {top_chunk_snippet}"`. | Grounded prompt sent to LLM using structured prompt skeleton. |
-| **Node 3: General Question Answer** | Deterministic string: `"I can only answer questions about Zepto policies right now."`. | Direct conversational response generated by LLM without retrieval. |
-| **Validation & Retries** | Programmatically populated Pydantic model (`confidence = 1.0`). | JSON schema parser with up to 2 corrective retries on validation failure. |
+- **Default Mock Mode (`MOCK_LLM=1` or unset)**:
+  - This is the graded baseline and requires no API key or external service.
+  - `classify_intent` uses a keyword rule: if the query contains `delivery`, `return`, `refund`, `membership`, `tracking`, `cancel`, `gift card`, or `support hours`, it routes to `policy_question`; otherwise, it routes to `general_question`.
+  - ChromaDB retrieval runs for real in both modes.
+  - `retrieve_and_answer` returns a deterministic templated snippet of the top chunk: `f"Based on the retrieved context: {top_chunk_snippet}"` with source document IDs and confidence `1.0`.
+  - `direct_answer` returns: `"I can only answer questions about Zepto policies right now."` with sources `[]`.
+- **Real LLM Mode (`MOCK_LLM=0`)**:
+  - Routes and generates answers using an LLM (e.g., Groq free tier).
+  - Uses the structured prompt template in `rag.py`.
+  - If output fails JSON schema validation, it retries up to 2 times before falling back cleanly.
 
 ---
 
-## 4. Structured Prompt Template
-
-Located in `support_assistant/rag.py` as `RAG_SYSTEM_PROMPT`:
+## 3. Structured Prompt Template
+Located in `support_assistant/rag.py`:
 
 ```text
 You are Zepto's official AI Policy Assistant (ROLE).
@@ -109,20 +111,18 @@ Response:
 
 ---
 
-## 5. Live FastAPI Endpoint Demonstration
+## 4. Live API Test Transcripts (`MOCK_LLM=1`)
 
-Executed against the local test suite with `MOCK_LLM=1` (graded baseline):
+These example calls were run against the local FastAPI test suite:
 
 ### Call 1: Policy Question (Triggers Retrieval)
-- **Endpoint**: `POST /ask`
-- **Request**:
 ```json
+// POST /ask
 {
   "query": "What is the delivery fee for orders under INR 149?"
 }
 ```
-- **Status Code**: `200 OK`
-- **Response JSON**:
+**Response (200 OK):**
 ```json
 {
   "answer": "Based on the retrieved context: Zepto delivers grocery and household essentials to serviceable pin codes within 10 to 30 minutes of order confirmation, depending on the customer's delivery zone and current order volume. Standard del",
@@ -134,15 +134,13 @@ Executed against the local test suite with `MOCK_LLM=1` (graded baseline):
 ```
 
 ### Call 2: General Question (Routes to Direct Answer, No Retrieval)
-- **Endpoint**: `POST /ask`
-- **Request**:
 ```json
+// POST /ask
 {
   "query": "Can you explain quantum computing?"
 }
 ```
-- **Status Code**: `200 OK`
-- **Response JSON**:
+**Response (200 OK):**
 ```json
 {
   "answer": "I can only answer questions about Zepto policies right now.",
@@ -151,16 +149,14 @@ Executed against the local test suite with `MOCK_LLM=1` (graded baseline):
 }
 ```
 
-### Call 3: Additional Policy Question (Returns & Refunds)
-- **Endpoint**: `POST /ask`
-- **Request**:
+### Call 3: Perishable Goods Return Window
 ```json
+// POST /ask
 {
   "query": "How many days do I have to report a return for perishable grocery items?"
 }
 ```
-- **Status Code**: `200 OK`
-- **Response JSON**:
+**Response (200 OK):**
 ```json
 {
   "answer": "Based on the retrieved context: Grocery and perishable items may be reported for a return within 24 hours of delivery if damaged, spoiled, or incorrect; non-perishable packaged items may be returned within 7 days of delivery in unop",
@@ -173,26 +169,22 @@ Executed against the local test suite with `MOCK_LLM=1` (graded baseline):
 
 ---
 
-## 6. How to Run
+## 5. How to Run
 
-### Run Locally via Python / Uvicorn
+### Run Local API & Web Dashboard:
 ```bash
-# Ingest corpus and run server
-python -m support_assistant.rag
-uvicorn support_assistant.main:app --host 0.0.0.0 --port 7860
+# Ingest documents and start server
+python -m uvicorn support_assistant.main:app --host 0.0.0.0 --port 7860
 ```
-Interactive API documentation is accessible at `http://localhost:7860/docs`.
+Open `http://localhost:7860` in a browser for the interactive chat interface, or `http://localhost:7860/docs` for the Swagger API docs.
 
-### Run Automated Endpoint Tests
+### Run Automated Tests:
 ```bash
 python -m support_assistant.test_api
 ```
 
-### Run via Docker
+### Run with Docker:
 ```bash
-# Build Docker image
 docker build -t zepto-support-assistant -f support_assistant/Dockerfile .
-
-# Run container
-docker run -p 7860:7860 -e MOCK_LLM=1 zepto-support-assistant
+docker run -p 7860:7860 zepto-support-assistant
 ```
