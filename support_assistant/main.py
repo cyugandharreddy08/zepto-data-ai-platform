@@ -1,4 +1,7 @@
-﻿import os
+import os
+import sys
+# Ensure project root is on python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import sqlite3
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -605,3 +608,7 @@ def serve_dashboard():
 </body>
 </html>
 """
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
